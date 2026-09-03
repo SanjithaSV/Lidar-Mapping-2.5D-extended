@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local datasets / downloaded scans / runtime cache
+kitti/
+cache/
+*.bin
+*.label
+*.npz
+driving_data.csv
+
+# Model checkpoints (preserve detector weights required by predict.py)
+*.pt
+*.pth
+*.ckpt
+!trail/best.pt
+
+# Generated viewer/runtime artifacts
+viewer_data.js
+viewer_data.json
+viewer_surface.json
+viewer.html
+player.html
+artifacts/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

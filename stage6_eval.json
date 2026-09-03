@@ -1,0 +1,89 @@
+{
+  "dataset": {
+    "pairs": [
+      [
+        0,
+        100
+      ],
+      [
+        100,
+        150
+      ],
+      [
+        150,
+        300
+      ],
+      [
+        300,
+        450
+      ],
+      [
+        450,
+        600
+      ],
+      [
+        600,
+        750
+      ],
+      [
+        750,
+        900
+      ],
+      [
+        900,
+        1050
+      ],
+      [
+        1050,
+        1200
+      ],
+      [
+        1200,
+        1350
+      ]
+    ],
+    "samples": 132,
+    "note": "Sparse labeled frames are used because the packaged artifact has no consecutive raw sequence. This is a diagnostic benchmark, not a final generalization result."
+  },
+  "geometry": {
+    "n": 132,
+    "positives": 1,
+    "accuracy": 0.5833333333333334,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "tp": 0,
+    "tn": 77,
+    "fp": 54,
+    "fn": 1
+  },
+  "mlp_high_confidence": {
+    "n": 132,
+    "positives": 1,
+    "accuracy": 0.9924242424242424,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "tp": 0,
+    "tn": 131,
+    "fp": 0,
+    "fn": 1
+  },
+  "hybrid": {
+    "n": 132,
+    "positives": 1,
+    "accuracy": 0.7272727272727273,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "tp": 0,
+    "tn": 96,
+    "fp": 35,
+    "fn": 1
+  },
+  "mlp": {
+    "mean_probability": 0.33557024598121643,
+    "high_confidence_fraction": 0.5227272727272727,
+    "overrides": 19
+  }
+}

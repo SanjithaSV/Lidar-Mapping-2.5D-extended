@@ -41,7 +41,12 @@ class JobSpec(BaseModel):
 
 def _run(job_id: str):
     job = JOBS[job_id]
+    # start every download at once, three at a time, while the main loop
+    # labels and converts whatever has landed. fetching dominates a cold run
+    # (~38 s a frame) and it is pure I/O, so overlapping it is nearly free.
     want_truth = job['source'] == 'truth'
+    # photos are pulled on a separate, lower-priority lane so a slow image
+    # never delays the map it belongs to
     if job['camera']:
         for f in job['frames']:
             job['cam_pool'].submit(P.prefetch_image, job['seq'], f)
@@ -55,7 +60,7 @@ def _run(job_id: str):
         if job['cancel']:
             break
         try:
-            futs[fid].result()
+            futs[fid].result()                 # its download is done (or failed)
             prev_for_motion = prev_fid if job['spec']['mode'] == 'sequential' else None
             out = P.build(job['seq'], fid, job['source'], job['detail'],
                           prev_frame=prev_for_motion, previous_objects=prev_objects,
@@ -71,7 +76,7 @@ def _run(job_id: str):
                       npts=out['npts'], ncells=out['ncells'],
                       drivable=out['drivable'], ms=out['ms'],
                       ego=out.get('ego'), motion=out.get('motion'), objects=out.get('objects', []))
-        except Exception as e:
+        except Exception as e:                       # keep going; report it
             traceback.print_exc()
             with _lock:
                 job['errors'].append({'frame': fid, 'error': str(e)})
@@ -80,7 +85,8 @@ def _run(job_id: str):
     pool.shutdown(wait=False, cancel_futures=True)
     job['cam_pool'].shutdown(wait=False, cancel_futures=True)
     job['state'] = 'cancelled' if job['cancel'] else 'done'
-    job['events'].put(dict(type='end', state=job['state'], errors=len(job['errors'])))
+    job['events'].put(dict(type='end', state=job['state'],
+                           errors=len(job['errors'])))
 
 
 @app.get('/api/sequences')
@@ -94,8 +100,6 @@ def sequences():
 def create(spec: JobSpec):
     if spec.count < 1 or spec.count > 60:
         raise HTTPException(400, 'count must be 1..60')
-    if spec.seq not in P.SEQ_LEN:
-        raise HTTPException(400, f'unknown sequence {spec.seq}')
     # Sequential mode is always truly consecutive. The stride field is
     # intentionally ignored here so a sequential job can never silently
     # skip frames (e.g. 000000 -> 000100). Random mode remains sampled.
@@ -107,8 +111,8 @@ def create(spec: JobSpec):
     jid = uuid.uuid4().hex[:12]
     JOBS[jid] = dict(id=jid, seq=spec.seq, source=spec.source, frames=frames,
                      camera=spec.camera, detail=max(1, min(4, spec.detail)),
-                     done={}, order=[], errors=[], events=queue.Queue(),
-                     state='running', cancel=False,
+                     done={}, order=[], errors=[],
+                     events=queue.Queue(), state='running', cancel=False,
                      cam_pool=ThreadPoolExecutor(max_workers=2, thread_name_prefix='cam'),
                      spec=spec.model_dump())
     threading.Thread(target=_run, args=(jid,), daemon=True).start()
@@ -121,7 +125,8 @@ def status(jid: str):
     if not j:
         raise HTTPException(404, 'no such job')
     return {'id': jid, 'state': j['state'], 'total': len(j['frames']),
-            'ready': list(j['order']), 'errors': j['errors'], 'spec': j['spec']}
+            'ready': list(j['order']), 'errors': j['errors'],
+            'spec': j['spec']}
 
 
 @app.post('/api/jobs/{jid}/cancel')
@@ -138,6 +143,7 @@ async def events(jid: str):
     j = JOBS.get(jid)
     if not j:
         raise HTTPException(404, 'no such job')
+
     async def gen():
         loop = asyncio.get_event_loop()
         while True:
@@ -149,8 +155,10 @@ async def events(jid: str):
             yield f'data: {json.dumps(ev)}\n\n'
             if ev.get('type') == 'end':
                 return
+
     return StreamingResponse(gen(), media_type='text/event-stream',
-                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+                             headers={'Cache-Control': 'no-cache',
+                                      'X-Accel-Buffering': 'no'})
 
 
 @app.get('/api/jobs/{jid}/frame/{fid}')
@@ -173,7 +181,8 @@ def image(jid: str, fid: str):
         p = P.image(j['seq'], fid)
     except Exception as e:
         raise HTTPException(404, f'no camera frame: {e}')
-    return FileResponse(p, media_type='image/png', headers={'Cache-Control': 'public, max-age=86400'})
+    return FileResponse(p, media_type='image/png',
+                        headers={'Cache-Control': 'public, max-age=86400'})
 
 
 @app.get('/api/health')
