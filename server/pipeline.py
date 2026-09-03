@@ -509,14 +509,17 @@ def build(seq: str, frame: str, source: str = 'model', mult: int = SURF_MULT,
     return out
 
 
-def frame_ids(seq: str, mode: str, start: int, count: int, stride: int, seed: int = 0):
+def frame_ids(seq: str, mode: str, start: int, count: int, stride: int = 1, seed: int = 0):
     """sequential = consecutive motion; random = scattered across the sequence."""
     n = SEQ_LEN.get(seq, 1000)
-    if mode == 'random':
+    m = (mode or 'sequential').strip().lower()
+    if m == 'random':
         rng = np.random.default_rng(seed)
         ids = sorted(rng.choice(n, size=min(count, n), replace=False).tolist())
     else:
-        ids = [start + i*stride for i in range(count) if start + i*stride < n]
+        # Sequential mode MUST ALWAYS process consecutive frames (start, start+1, start+2, ...)
+        # Stride MUST NOT affect sequential mode under any circumstances.
+        ids = [start + i for i in range(count) if start + i < n]
     return [f'{i:06d}' for i in ids]
 
 

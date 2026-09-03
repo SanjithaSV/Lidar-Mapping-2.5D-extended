@@ -52,6 +52,7 @@ const pal = () => { if (!SP){ SP = shades(SPECTRAL); CL = shades(CLASSC);
 /* ------------------------------------------------------------------ state */
 const S = {
   job:null, frames:[], data:new Map(), cur:-1, playing:false, spf:600, last:0,
+  mode:'sequential',
   src:'ztop', paint:'height', mesh:true, rings:true, camera:true, proj:true,
   ob:{az:3.90, el:.40, S:14, px0:0, py0:0, vex:2}, drag:null, es:null, touched:false,
 };
@@ -343,9 +344,12 @@ function tick(t){
   if (!S.playing) return;
   if (t - S.last >= S.spf){
     S.last = t;
-    let n = S.cur, tries = 0;
-    do { n = (n+1) % S.frames.length; tries++; } while (!frameOf(S.frames[n]) && tries < S.frames.length);
-    show(n);
+    if (S.frames.length > 0){
+      const next = (S.cur + 1) % S.frames.length;
+      if (frameOf(S.frames[next])){
+        show(next);
+      }
+    }
   }
   requestAnimationFrame(tick);
 }
@@ -510,22 +514,23 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', ()=>{ SP=n
 function setState(s, cls){ $('state').textContent = s; $('dot').className = 'dot '+(cls||''); }
 
 function applyMode(mode){
-  const isSeq = mode === 'sequential';
+  S.mode = mode === 'random' ? 'random' : 'sequential';
+  const isSeq = S.mode === 'sequential';
+  [...$('mode').children].forEach(b =>
+    b.setAttribute('aria-pressed', String(b.dataset.v === S.mode)));
   $('start').disabled = !isSeq;
   $('seed').disabled = isSeq;
-  if (isSeq){
-    $('stride').value = 1;
-    $('stride').disabled = true;
-  } else {
-    $('stride').disabled = true;
-  }
+  $('stride').value = 1;
+  $('stride').disabled = true;
   $('hint').textContent = isSeq
     ? 'Sequential frames are consecutive sweeps — real motion. Nothing is precomputed: each frame is pulled, labelled, converted and reduced when you ask for it.'
     : 'Random frames are scattered across the whole sequence — unrelated scenes, good for coverage.';
 }
 
-seg('mode', ()=>document.querySelector('#mode [aria-pressed=true]').dataset.v, v=>{
-  applyMode(v);
+$('mode').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  applyMode(b.dataset.v);
 });
 
 async function run(){
@@ -534,14 +539,17 @@ async function run(){
   $('play').textContent='Play'; $('err').textContent=''; $('empty').style.display='';
   $('tagL').hidden = $('tagB').hidden = true;
   $('cam').hidden = true; $('camimg').dataset.f = '';
-  const mode = document.querySelector('#mode [aria-pressed=true]').dataset.v;
+  const isSeq = S.mode === 'sequential';
   const spec = {
     seq: $('seq').value,
-    mode: mode,
-    start: +$('start').value, count: +$('count').value,
-    stride: mode === 'sequential' ? 1 : Math.max(1, +$('stride').value || 1),
-    source: $('source').value, seed: +$('seed').value,
-    camera: S.camera, detail: +$('detail').value,
+    mode: isSeq ? 'sequential' : 'random',
+    start: isSeq ? +$('start').value : 0,
+    count: +$('count').value,
+    stride: 1,
+    source: $('source').value,
+    seed: isSeq ? 0 : +$('seed').value,
+    camera: S.camera,
+    detail: +$('detail').value,
   };
   $('go').disabled = true; $('stop').hidden = false;
   setState('starting', 'run');
@@ -613,9 +621,7 @@ $('stop').onclick = async () => { if (S.job) await fetch(`/api/jobs/${S.job}/can
   const q = new URLSearchParams(location.search);
   for (const k of ['seq','source','start','count','stride','seed','detail'])
     if (q.has(k)) $(k).value = q.get(k);
-  const initMode = q.get('mode') || document.querySelector('#mode [aria-pressed=true]')?.dataset?.v || 'sequential';
-  [...$('mode').children].forEach(b =>
-    b.setAttribute('aria-pressed', String(b.dataset.v === initMode)));
+  const initMode = (q.get('mode') === 'random') ? 'random' : 'sequential';
   applyMode(initMode);
   for (const [id, k] of [['src','src'], ['paint','paint']])
     if (q.has(k)){

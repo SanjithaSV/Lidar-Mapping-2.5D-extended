@@ -56,16 +56,19 @@ def _run(job_id: str):
     prev_fid = None
     prev_objects = []
     next_track_id = 1
+    is_seq = (job['spec'].get('mode') or 'sequential').strip().lower() == 'sequential'
     for i, fid in enumerate(job['frames']):
         if job['cancel']:
             break
         try:
             futs[fid].result()                 # its download is done (or failed)
-            prev_for_motion = prev_fid if job['spec']['mode'] == 'sequential' else None
+            prev_for_motion = prev_fid if is_seq else None
+            if is_seq:
+                print(f"[SEQUENTIAL] Processing frame {fid} prev={prev_for_motion} (frame {i+1}/{len(job['frames'])})", flush=True)
             out = P.build(job['seq'], fid, job['source'], job['detail'],
                           prev_frame=prev_for_motion, previous_objects=prev_objects,
                           next_track_id=next_track_id)
-            if job['spec']['mode'] == 'sequential':
+            if is_seq:
                 prev_objects = out.get('objects', [])
                 next_track_id = int(out.get('next_track_id', next_track_id))
             prev_fid = fid
@@ -100,21 +103,27 @@ def sequences():
 def create(spec: JobSpec):
     if spec.count < 1 or spec.count > 60:
         raise HTTPException(400, 'count must be 1..60')
+    if spec.seq not in P.SEQ_LEN:
+        raise HTTPException(400, f'unknown sequence {spec.seq}')
+    mode = (spec.mode or 'sequential').strip().lower()
     # Sequential mode is always truly consecutive. The stride field is
     # intentionally ignored here so a sequential job can never silently
     # skip frames (e.g. 000000 -> 000100). Random mode remains sampled.
-    stride = 1 if spec.mode == 'sequential' else max(1, spec.stride)
-    frames = P.frame_ids(spec.seq, spec.mode, spec.start, spec.count,
+    stride = 1 if mode == 'sequential' else max(1, spec.stride)
+    frames = P.frame_ids(spec.seq, mode, spec.start, spec.count,
                          stride, spec.seed)
     if not frames:
         raise HTTPException(400, 'that range contains no frames')
     jid = uuid.uuid4().hex[:12]
+    spec_dict = spec.model_dump()
+    spec_dict['mode'] = mode
+    spec_dict['stride'] = stride
     JOBS[jid] = dict(id=jid, seq=spec.seq, source=spec.source, frames=frames,
                      camera=spec.camera, detail=max(1, min(4, spec.detail)),
                      done={}, order=[], errors=[],
                      events=queue.Queue(), state='running', cancel=False,
                      cam_pool=ThreadPoolExecutor(max_workers=2, thread_name_prefix='cam'),
-                     spec=spec.model_dump())
+                     spec=spec_dict)
     threading.Thread(target=_run, args=(jid,), daemon=True).start()
     return {'id': jid, 'frames': frames, 'state': 'running'}
 
@@ -189,6 +198,24 @@ def image(jid: str, fid: str):
 def health():
     return {'ok': True, 'cached_frames': len(list(P.OUT.glob('*.json'))),
             'cached_raw': len(list(P.RAW.glob('*.bin')))}
+
+
+@app.get('/')
+def serve_index():
+    return FileResponse(ROOT / 'web' / 'index.html', media_type='text/html',
+                        headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
+
+
+@app.get('/app.js')
+def serve_js():
+    return FileResponse(ROOT / 'web' / 'app.js', media_type='application/javascript',
+                        headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
+
+
+@app.get('/style.css')
+def serve_css():
+    return FileResponse(ROOT / 'web' / 'style.css', media_type='text/css',
+                        headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
 
 
 app.mount('/', StaticFiles(directory=ROOT / 'web', html=True), name='web')
