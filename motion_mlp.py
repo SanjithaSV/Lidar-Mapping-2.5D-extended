@@ -139,6 +139,8 @@ def refine(objects, ego, predictor: MotionMLP | None,
             state = "STATIC"
         else:
             state = old
+        # Combine learned evidence with the existing geometric confidence;
+        # this is intentionally not presented as a calibrated probability.
         geom = _finite(q.get("confidence", 0.0))
         learned_conf = abs(p - 0.5) * 2.0
         q["mlp_dynamic_probability"] = p
