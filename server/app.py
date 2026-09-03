@@ -41,12 +41,8 @@ class JobSpec(BaseModel):
 
 def _run(job_id: str):
     job = JOBS[job_id]
-    # start every download at once, three at a time, while the main loop
-    # labels and converts whatever has landed. fetching dominates a cold run
-    # (~38 s a frame) and it is pure I/O, so overlapping it is nearly free.
     want_truth = job['source'] == 'truth'
-    # photos are pulled on a separate, lower-priority lane so a slow image
-    # never delays the map it belongs to
+    is_seq = (job['spec'].get('mode') or 'sequential').strip().lower() == 'sequential'
     if job['camera']:
         for f in job['frames']:
             job['cam_pool'].submit(P.prefetch_image, job['seq'], f)
@@ -56,15 +52,13 @@ def _run(job_id: str):
     prev_fid = None
     prev_objects = []
     next_track_id = 1
-    is_seq = (job['spec'].get('mode') or 'sequential').strip().lower() == 'sequential'
     for i, fid in enumerate(job['frames']):
         if job['cancel']:
             break
+        prev_for_motion = prev_fid if is_seq else None
+        print(f"[SEQUENTIAL] START frame={fid} prev={prev_for_motion} (frame {i+1}/{len(job['frames'])})", flush=True)
         try:
             futs[fid].result()                 # its download is done (or failed)
-            prev_for_motion = prev_fid if is_seq else None
-            if is_seq:
-                print(f"[SEQUENTIAL] Processing frame {fid} prev={prev_for_motion} (frame {i+1}/{len(job['frames'])})", flush=True)
             out = P.build(job['seq'], fid, job['source'], job['detail'],
                           prev_frame=prev_for_motion, previous_objects=prev_objects,
                           next_track_id=next_track_id)
@@ -75,21 +69,36 @@ def _run(job_id: str):
             with _lock:
                 job['done'][fid] = out
                 job['order'].append(fid)
+            print(f"[SEQUENTIAL] SUCCESS frame={fid}", flush=True)
             ev = dict(type='frame', index=i, frame=fid, cached=out['cached'],
                       npts=out['npts'], ncells=out['ncells'],
                       drivable=out['drivable'], ms=out['ms'],
                       ego=out.get('ego'), motion=out.get('motion'), objects=out.get('objects', []))
         except Exception as e:                       # keep going; report it
+            print(f"[SEQUENTIAL] FAILED frame={fid} error={e}", flush=True)
             traceback.print_exc()
             with _lock:
                 job['errors'].append({'frame': fid, 'error': str(e)})
             ev = dict(type='error', index=i, frame=fid, error=str(e))
-        job['events'].put(ev)
+        ev = P.sanitize_json_obj(ev)
+        with _lock:
+            job['history'].append(ev)
+            for q in list(job.get('listeners', [])):
+                try:
+                    q.put_nowait(ev)
+                except Exception:
+                    pass
     pool.shutdown(wait=False, cancel_futures=True)
     job['cam_pool'].shutdown(wait=False, cancel_futures=True)
-    job['state'] = 'cancelled' if job['cancel'] else 'done'
-    job['events'].put(dict(type='end', state=job['state'],
-                           errors=len(job['errors'])))
+    with _lock:
+        job['state'] = 'cancelled' if job['cancel'] else 'done'
+        end_ev = dict(type='end', state=job['state'], errors=len(job['errors']))
+        job['history'].append(end_ev)
+        for q in list(job.get('listeners', [])):
+            try:
+                q.put_nowait(end_ev)
+            except Exception:
+                pass
 
 
 @app.get('/api/sequences')
@@ -121,7 +130,8 @@ def create(spec: JobSpec):
     JOBS[jid] = dict(id=jid, seq=spec.seq, source=spec.source, frames=frames,
                      camera=spec.camera, detail=max(1, min(4, spec.detail)),
                      done={}, order=[], errors=[],
-                     events=queue.Queue(), state='running', cancel=False,
+                     history=[], listeners=[],
+                     state='running', cancel=False,
                      cam_pool=ThreadPoolExecutor(max_workers=2, thread_name_prefix='cam'),
                      spec=spec_dict)
     threading.Thread(target=_run, args=(jid,), daemon=True).start()
@@ -153,17 +163,38 @@ async def events(jid: str):
     if not j:
         raise HTTPException(404, 'no such job')
 
+    q = queue.Queue()
+    with _lock:
+        past = list(j.get('history', []))
+        is_done = j['state'] in ('done', 'cancelled')
+        if not is_done:
+            j.setdefault('listeners', []).append(q)
+
     async def gen():
         loop = asyncio.get_event_loop()
-        while True:
-            try:
-                ev = await loop.run_in_executor(None, j['events'].get, True, 30)
-            except queue.Empty:
-                yield ': keepalive\n\n'
-                continue
-            yield f'data: {json.dumps(ev)}\n\n'
-            if ev.get('type') == 'end':
+        try:
+            # Replay all past events so reconnecting or delayed listeners never miss anything
+            for ev in past:
+                yield f'data: {json.dumps(ev, allow_nan=False)}\n\n'
+                if ev.get('type') == 'end':
+                    return
+            if is_done:
                 return
+
+            while True:
+                try:
+                    ev = await loop.run_in_executor(None, q.get, True, 30)
+                except queue.Empty:
+                    yield ': keepalive\n\n'
+                    continue
+                yield f'data: {json.dumps(ev, allow_nan=False)}\n\n'
+                if ev.get('type') == 'end':
+                    return
+        finally:
+            with _lock:
+                listeners = j.get('listeners', [])
+                if q in listeners:
+                    listeners.remove(q)
 
     return StreamingResponse(gen(), media_type='text/event-stream',
                              headers={'Cache-Control': 'no-cache',

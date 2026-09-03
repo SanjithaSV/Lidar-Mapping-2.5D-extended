@@ -11,6 +11,7 @@ is the apparent motion induced by the ego vehicle.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 import numpy as np
 from scipy import ndimage
@@ -341,8 +342,8 @@ def _trajectory_stats(history_xy, dt: float, window: int = 6):
     if h.ndim != 2 or h.shape[1] != 2 or len(h) < 2:
         return dict(history_len=int(len(h)), displacement_m=0.0,
                     velocity_xy_mps=[0.0, 0.0], speed_mps=0.0,
-                    speed_kmh=0.0, velocity_std_mps=float('nan'),
-                    direction_consistency=0.0, trajectory_rmse_m=float('nan'))
+                    speed_kmh=0.0, velocity_std_mps=0.0,
+                    direction_consistency=0.0, trajectory_rmse_m=0.0)
     h = h[-max(2, int(window)):]
     n = len(h)
     # Fit a straight line independently in x/y.  This is less sensitive to
@@ -372,13 +373,19 @@ def _trajectory_stats(history_xy, dt: float, window: int = 6):
     else:
         consistency = 0.0
     disp = float(np.linalg.norm(h[-1] - h[0]))
+    v_std = float(np.std(seg_speed)) if len(seg_speed) else 0.0
+    if math.isnan(v_std) or math.isinf(v_std):
+        v_std = 0.0
+    t_rmse = float(np.sqrt(np.mean(err ** 2))) if len(err) else 0.0
+    if math.isnan(t_rmse) or math.isinf(t_rmse):
+        t_rmse = 0.0
     return dict(history_len=n, displacement_m=disp,
                 velocity_xy_mps=vel.astype(float).tolist(),
                 speed_mps=float(np.linalg.norm(vel)),
                 speed_kmh=float(np.linalg.norm(vel) * 3.6),
-                velocity_std_mps=float(np.std(seg_speed)) if len(seg_speed) else 0.0,
+                velocity_std_mps=v_std,
                 direction_consistency=consistency,
-                trajectory_rmse_m=float(np.sqrt(np.mean(err ** 2))))
+                trajectory_rmse_m=t_rmse)
 
 
 def track_objects(previous_objects, current_objects, ego: EgoMotion, dt: float,

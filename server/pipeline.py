@@ -10,7 +10,7 @@ instant, but the cache is an optimisation, not the source of truth.
 
 from __future__ import annotations
 
-import base64, io, json, os, queue, sys, threading, time
+import base64, io, json, math, os, queue, sys, threading, time
 from pathlib import Path
 
 import numpy as np
@@ -330,6 +330,23 @@ def truth_objects(pts4: np.ndarray, labp: Path):
         static_instances=static_instances)
 
 
+def sanitize_json_obj(obj):
+    if isinstance(obj, float):
+        return 0.0 if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: sanitize_json_obj(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_json_obj(v) for v in obj]
+    if isinstance(obj, np.floating):
+        f = float(obj)
+        return 0.0 if (math.isnan(f) or math.isinf(f)) else f
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return sanitize_json_obj(obj.tolist())
+    return obj
+
+
 def build(seq: str, frame: str, source: str = 'model', mult: int = SURF_MULT,
           prev_frame: str | None = None, motion_dt: float = 0.1,
           previous_objects=None, next_track_id: int = 1):
@@ -505,7 +522,8 @@ def build(seq: str, frame: str, source: str = 'model', mult: int = SURF_MULT,
         cam=_safe_calib(seq),
         proj=_safe_project(seq, np.stack([x, y, z], 1), lab),
     )
-    key.write_text(json.dumps(out, separators=(',', ':')))
+    out = sanitize_json_obj(out)
+    key.write_text(json.dumps(out, separators=(',', ':'), allow_nan=False))
     return out
 
 

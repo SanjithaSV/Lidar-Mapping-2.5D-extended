@@ -552,6 +552,7 @@ async function run(){
     detail: +$('detail').value,
   };
   $('go').disabled = true; $('stop').hidden = false;
+  if (S.pollTimer){ clearInterval(S.pollTimer); S.pollTimer = null; }
   setState('starting', 'run');
   let r;
   try {
@@ -566,50 +567,149 @@ async function run(){
   $('scrub').max = S.frames.length-1;
   $('transport').hidden = false;
   $('strip').innerHTML = S.frames.map((f,i)=>
-    `<div class="cellbox" data-i="${i}" title="frame ${f}">${i+1}</div>`).join('');
+    `<div class="cellbox" data-i="${i}" data-f="${f}" title="frame ${f}">${i+1}</div>`).join('');
   $('strip').onclick = e => {
     const b = e.target.closest('.cellbox');
     if (b && b.classList.contains('ready')){ S.playing=false; $('play').textContent='Play'; show(+b.dataset.i); }
   };
   $('strip').children[0]?.classList.add('busy');
-  let ready = 0;
   setState(`running 0/${S.frames.length}`, 'run');
 
   let finished = false;
+
+  async function loadFrame(fid, index, meta){
+    if (S.data.has(fid)) return;
+    try {
+      const res = await fetch(`/api/jobs/${r.id}/frame/${fid}`);
+      if (!res.ok) return;
+      const text = await res.text();
+      let d;
+      try {
+        d = JSON.parse(text);
+      } catch(e) {
+        d = JSON.parse(text.replace(/:\s*NaN\b/g, ': 0.0'));
+      }
+      S.data.set(fid, d);
+      const box = $('strip').children[index];
+      if (box){
+        box.classList.remove('busy', 'err');
+        box.classList.add('ready');
+        box.title = `frame ${fid} · ${fmt(d.ncells)} cells · ${d.drivable}% drivable`
+          + (d.cached ? ' · cached' : '');
+      }
+      const ready = S.data.size;
+      if (!finished) setState(`running ${ready}/${S.frames.length}`, 'run');
+      if (meta && meta.ms){
+        $('prog').textContent = `${ready} of ${S.frames.length} ready`
+          + `  ·  fetch ${meta.ms.fetch} ms, labels ${meta.ms.label} ms, grid ${meta.ms.grid} ms`;
+      } else {
+        $('prog').textContent = `${ready} of ${S.frames.length} ready`;
+      }
+      if (S.cur < 0){ show(index); fit(); redraw(); }
+    } catch(err){
+      console.warn(`Could not load frame ${fid}`, err);
+    }
+  }
+
+  async function syncStatus(){
+    try {
+      const st = await (await fetch(`/api/jobs/${r.id}`)).json();
+      if (st && st.ready){
+        for (const fid of st.ready){
+          const idx = S.frames.indexOf(fid);
+          if (idx >= 0 && !S.data.has(fid)){
+            await loadFrame(fid, idx);
+          }
+        }
+      }
+      if (st && st.errors){
+        for (const errItem of st.errors){
+          const idx = S.frames.indexOf(errItem.frame);
+          if (idx >= 0){
+            const box = $('strip').children[idx];
+            if (box){
+              box.classList.remove('busy');
+              box.classList.add('err');
+              box.title = errItem.error;
+            }
+          }
+        }
+      }
+      if (st && (st.state === 'done' || st.state === 'cancelled') && !finished){
+        finished = true;
+        if (S.es){ S.es.close(); S.es = null; }
+        if (S.pollTimer){ clearInterval(S.pollTimer); S.pollTimer = null; }
+        const ready = S.data.size;
+        setState(st.state === 'done' ? `${ready} frames ready` : st.state,
+                 st.errors && st.errors.length ? 'err' : 'done');
+        $('go').disabled = false; $('stop').hidden = true;
+        [...$('strip').children].forEach(b => b.classList.remove('busy'));
+      }
+    } catch(err){
+      // ignore transient sync errors
+    }
+  }
+
+  S.pollTimer = setInterval(async () => {
+    if (finished){
+      if (S.pollTimer){ clearInterval(S.pollTimer); S.pollTimer = null; }
+      return;
+    }
+    await syncStatus();
+  }, 1000);
+
   S.es = new EventSource(`/api/jobs/${r.id}/events`);
   S.es.onmessage = async ev => {
-    const m = JSON.parse(ev.data);
+    let m;
+    try {
+      m = JSON.parse(ev.data);
+    } catch(err){
+      try {
+        m = JSON.parse(ev.data.replace(/:\s*NaN\b/g, ': 0.0'));
+      } catch(err2){
+        console.warn('Failed to parse event data, syncing via API:', err2);
+        await syncStatus();
+        return;
+      }
+    }
     if (m.type === 'frame'){
-      const d = await (await fetch(`/api/jobs/${r.id}/frame/${m.frame}`)).json();
-      S.data.set(m.frame, d);
-      const box = $('strip').children[m.index];
-      box.classList.remove('busy'); box.classList.add('ready');
-      box.title = `frame ${m.frame} · ${fmt(d.ncells)} cells · ${d.drivable}% drivable`
-        + (m.cached ? ' · cached' : '');
-      $('strip').children[m.index+1]?.classList.add('busy');
-      ready++;
-      if (!finished) setState(`running ${ready}/${S.frames.length}`, 'run');
-      $('prog').textContent = `${ready} of ${S.frames.length} ready`
-        + `  ·  fetch ${m.ms.fetch} ms, labels ${m.ms.label} ms, grid ${m.ms.grid} ms`;
-      if (S.cur < 0){ show(m.index); fit(); redraw(); }
+      await loadFrame(m.frame, m.index, m);
+      const nextBox = $('strip').children[m.index + 1];
+      if (nextBox && !nextBox.classList.contains('ready') && !nextBox.classList.contains('err')){
+        nextBox.classList.add('busy');
+      }
     } else if (m.type === 'error'){
       const box = $('strip').children[m.index];
-      box.classList.remove('busy'); box.classList.add('err'); box.title = m.error;
+      if (box){
+        box.classList.remove('busy');
+        box.classList.add('err');
+        box.title = m.error;
+      }
       $('err').textContent = m.error;
-      $('strip').children[m.index+1]?.classList.add('busy');
+      const nextBox = $('strip').children[m.index + 1];
+      if (nextBox && !nextBox.classList.contains('ready')) nextBox.classList.add('busy');
     } else if (m.type === 'end'){
       finished = true;
-      S.es.close(); S.es = null;
-      setState(m.state === 'done' ? `${S.frames.length} frames ready` : m.state,
+      if (S.es){ S.es.close(); S.es = null; }
+      if (S.pollTimer){ clearInterval(S.pollTimer); S.pollTimer = null; }
+      await syncStatus();
+      const ready = S.data.size;
+      setState(m.state === 'done' ? `${ready} frames ready` : m.state,
                m.errors ? 'err' : 'done');
       $('go').disabled = false; $('stop').hidden = true;
       [...$('strip').children].forEach(b=>b.classList.remove('busy'));
     }
   };
-  S.es.onerror = () => { setState('stream lost','err'); $('go').disabled=false; $('stop').hidden=true; };
+  S.es.onerror = async () => {
+    // If SSE is lost or interrupted, do a status sync rather than immediately aborting
+    await syncStatus();
+  };
 }
 $('go').onclick = run;
-$('stop').onclick = async () => { if (S.job) await fetch(`/api/jobs/${S.job}/cancel`, {method:'POST'}); };
+$('stop').onclick = async () => {
+  if (S.pollTimer){ clearInterval(S.pollTimer); S.pollTimer = null; }
+  if (S.job) await fetch(`/api/jobs/${S.job}/cancel`, {method:'POST'});
+};
 
 (async function init(){
   const seqs = await (await fetch('/api/sequences')).json();
