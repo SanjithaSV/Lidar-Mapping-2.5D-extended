@@ -309,6 +309,9 @@ def truth_objects(pts4: np.ndarray, labp: Path):
     moving_instances = static_instances = 0
     for k in range(ncl):
         q = idx[dense == k]
+        if not len(q):
+            cluster_classes[k] = 0
+            continue
         cls = int(det_cls[q[0]])
         cluster_classes[k] = cls
         gt_dyn = bool(np.mean(moving[q]) >= 0.5)
@@ -321,9 +324,9 @@ def truth_objects(pts4: np.ndarray, labp: Path):
             gt_moving_fraction=float(np.mean(moving[q])), points=int(len(q))))
 
     counts = {
-        'Car': int(np.sum(cluster_classes == 1)),
-        'Pedestrian': int(np.sum(cluster_classes == 2)),
-        'Cyclist': int(np.sum(cluster_classes == 3)),
+        'Car': int(np.sum(cluster_classes == 1)) if len(cluster_classes) else 0,
+        'Pedestrian': int(np.sum(cluster_classes == 2)) if len(cluster_classes) else 0,
+        'Cyclist': int(np.sum(cluster_classes == 3)) if len(cluster_classes) else 0,
     }
     return mapped.astype(np.int64), full_cl, cluster_classes, clusters_meta, dict(
         clusters=ncl, counts=counts, moving_instances=moving_instances,
@@ -470,7 +473,10 @@ def build(seq: str, frame: str, source: str = 'model', mult: int = SURF_MULT,
                   | ((m['ix'] & 0x7fffffff) << 31) | (m['iy'] & 0x7fffffff))
             ci = np.searchsorted(ck, pk)
             ok = objp & (ci < len(ck))
-            ok &= ck[np.minimum(ci, len(ck)-1)] == pk
+            if len(ck) > 0:
+                ok &= ck[np.minimum(ci, len(ck)-1)] == pk
+            else:
+                ok = np.zeros(len(ci), bool)
             dc = np.zeros(len(ck), np.int32); sc = np.zeros(len(ck), np.int32)
             np.add.at(dc, ci[ok & (pm == 1)], 1)
             np.add.at(sc, ci[ok & (pm == 0)], 1)
@@ -483,18 +489,19 @@ def build(seq: str, frame: str, source: str = 'model', mult: int = SURF_MULT,
     t_surf = time.perf_counter() - t0
 
     s = g.memstats(m)
+    zg_bufs = [np.frombuffer(base64.b64decode(t['zgnd']), np.int16) for t in srf['tiers']]
+    zg_valid = [b for b in zg_bufs if len(b) > 0]
+    zglo = float(min(b.min() for b in zg_valid)) / 1000 if zg_valid else 0.0
+    zghi = float(max(b.max() for b in zg_valid)) / 1000 if zg_valid else 0.0
     out = dict(
         seq=seq, frame=frame, source=source,
         tiers=srf['tiers'], zlo=srf['zlo'], zhi=srf['zhi'],
-        zglo=float(min(np.frombuffer(base64.b64decode(t['zgnd']), np.int16).min()
-                       for t in srf['tiers'])) / 1000,
-        zghi=float(max(np.frombuffer(base64.b64decode(t['zgnd']), np.int16).max()
-                       for t in srf['tiers'])) / 1000,
+        zglo=zglo, zghi=zghi,
         npts=int(k.sum()), ncells=int(len(m['n'])), fine=int(s['fine']),
         uniform=int(s['uniform']),
-        drivable=round(100 * float(m['trav'].mean()), 1),
+        drivable=round(100 * float(m['trav'].mean()), 1) if len(m['trav']) > 0 else 0.0,
         lvlcount=[int((m['lvl'] == i).sum()) for i in range(4)],
-        clscount=[int(c) for c in np.bincount(m['cls'], minlength=8)],
+        clscount=[int(c) for c in np.bincount(m['cls'], minlength=8)] if len(m['cls']) > 0 else [0]*8,
         provcount=info.get('provcount', {}),
         clusters=info.get('clusters', 0),
         cars=info.get('counts', {}).get('Car', 0),

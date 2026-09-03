@@ -47,6 +47,8 @@ nrb = int(maxrange / drb) + 2    # last bin left empty so 'beyond' always exists
 
 def _group(key):
     """sort by key, return the permutation, group starts and group sizes."""
+    if len(key) == 0:
+        return np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.int64)
     o = np.argsort(key, kind='stable')
     k = key[o]
     st = np.flatnonzero(np.r_[True, k[1:] != k[:-1]])
@@ -62,9 +64,41 @@ def _pack(ix, iy):
 
 def quantise(x, y, z, lab, res=res0):
     """bin every point into a fine cell. no range logic here on purpose."""
+    if len(x) == 0:
+        return dict(
+            ix=np.empty(0, np.int64),
+            iy=np.empty(0, np.int64),
+            n=np.empty(0, np.int64),
+            zmin=np.empty(0, np.float64),
+            zmax=np.empty(0, np.float64),
+            zomin=np.empty(0, np.float64),
+            zsum=np.empty(0, np.float64),
+            zsq=np.empty(0, np.float64),
+            ng=np.empty(0, np.float64),
+            gmin=np.empty(0, np.float64),
+            gsum=np.empty(0, np.float64),
+            gsq=np.empty(0, np.float64),
+            hist=np.empty((0, nclass), np.int64),
+        )
     ix = np.floor(x / res).astype(np.int64)
     iy = np.floor(y / res).astype(np.int64)
     o, st, cnt = _group(_pack(ix, iy))
+    if len(st) == 0:
+        return dict(
+            ix=np.empty(0, np.int64),
+            iy=np.empty(0, np.int64),
+            n=np.empty(0, np.int64),
+            zmin=np.empty(0, np.float64),
+            zmax=np.empty(0, np.float64),
+            zomin=np.empty(0, np.float64),
+            zsum=np.empty(0, np.float64),
+            zsq=np.empty(0, np.float64),
+            ng=np.empty(0, np.float64),
+            gmin=np.empty(0, np.float64),
+            gsum=np.empty(0, np.float64),
+            gsq=np.empty(0, np.float64),
+            hist=np.empty((0, nclass), np.int64),
+        )
 
     zs, ls = z[o], lab[o]
     isg = np.isin(ls, groundcls)
@@ -98,7 +132,35 @@ def merge(c, key):
     merge cells sharing a key. identical maths to pass 1 because every
     accumulator is associative -- this is the point of the design.
     """
+    if len(key) == 0 or len(c.get('n', [])) == 0:
+        return dict(
+            n=np.empty(0, np.int64),
+            zmin=np.empty(0, np.float64),
+            zmax=np.empty(0, np.float64),
+            zomin=np.empty(0, np.float64),
+            zsum=np.empty(0, np.float64),
+            zsq=np.empty(0, np.float64),
+            ng=np.empty(0, np.float64),
+            gmin=np.empty(0, np.float64),
+            gsum=np.empty(0, np.float64),
+            gsq=np.empty(0, np.float64),
+            hist=np.empty((0, nclass), np.int64),
+        ), np.empty(0, np.int64), np.empty(0, np.int64)
     o, st, cnt = _group(key)
+    if len(st) == 0:
+        return dict(
+            n=np.empty(0, np.int64),
+            zmin=np.empty(0, np.float64),
+            zmax=np.empty(0, np.float64),
+            zomin=np.empty(0, np.float64),
+            zsum=np.empty(0, np.float64),
+            zsq=np.empty(0, np.float64),
+            ng=np.empty(0, np.float64),
+            gmin=np.empty(0, np.float64),
+            gsum=np.empty(0, np.float64),
+            gsq=np.empty(0, np.float64),
+            hist=np.empty((0, nclass), np.int64),
+        ), np.empty(0, np.int64), np.empty(0, np.int64)
     return dict(
         n=np.add.reduceat(c['n'][o], st),
         zmin=np.minimum.reduceat(c['zmin'][o], st),
