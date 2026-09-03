@@ -171,6 +171,13 @@ def remove_ground(pts: np.ndarray,
     to terrain.py's drivability scoring and they cost effectively nothing here,
     because the plane fit that produces them already runs.
     """
+    if len(pts) == 0:
+        n_sec = n_radial * n_azimuth
+        stats = {"slope": np.zeros(n_sec), "rough": np.zeros(n_sec), "h": np.full(n_sec, -sensor_h),
+                 "n": np.zeros(n_sec, np.int64), "sec": np.empty(0, np.int64),
+                 "n_radial": n_radial, "n_azimuth": n_azimuth, "max_range": max_range}
+        return np.zeros(0, np.bool_), np.zeros(0, np.float64), stats
+
     xy = pts[:, :2].astype(np.float64)
     r = np.sqrt(xy[:, 0] ** 2 + xy[:, 1] ** 2)
     th = np.arctan2(xy[:, 1], xy[:, 0])

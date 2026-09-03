@@ -149,7 +149,9 @@ def _icp_se2(previous_xy: np.ndarray, current_xy: np.ndarray,
             break
 
         ids = np.flatnonzero(valid)
-        keep_n = max(10, int(len(ids) * trim_fraction))
+        if len(ids) == 0:
+            break
+        keep_n = min(len(ids), max(1, int(len(ids) * trim_fraction)))
         order = np.argpartition(dist[ids], keep_n - 1)[:keep_n]
         ids = ids[order]
         src = moved[ids]
@@ -258,12 +260,15 @@ def object_motion(previous: np.ndarray, current: np.ndarray,
     # A full-scan tree is still cheap compared with the detector. Keep it in
     # XY because Stage 2 estimates planar SE(2), and vertical differences are
     # dominated by road/surface sampling rather than object motion.
-    tree = cKDTree(prev_xy)
+    tree = cKDTree(prev_xy) if len(prev_xy) else None
     residual = np.full(len(c), np.nan, dtype=np.float32)
     valid = cid >= 0
-    object_mask = valid & (cid < len(cls)) & np.isin(cls[np.maximum(cid, 0)], [1, 2, 3])
+    if len(cls) > 0:
+        object_mask = valid & (cid < len(cls)) & np.isin(cls[np.clip(cid, 0, len(cls) - 1)], [1, 2, 3])
+    else:
+        object_mask = np.zeros(len(c), bool)
     oi = np.flatnonzero(object_mask)
-    if len(oi):
+    if len(oi) and tree is not None:
         d, _ = tree.query(curr_xy[oi], k=1, distance_upper_bound=2.5)
         residual[oi] = np.where(np.isfinite(d), d, np.nan).astype(np.float32)
 
@@ -278,7 +283,7 @@ def object_motion(previous: np.ndarray, current: np.ndarray,
         if len(r) < min_points:
             clusters.append(dict(id=int(k), class_id=int(cls[k]), state="UNKNOWN",
                                  confidence=0.0, points=int(len(r)),
-                                 median_m=float('nan'), p75_m=float('nan'),
+                                 median_m=0.0, p75_m=0.0,
                                  moving_fraction=0.0))
             continue
         # Range-scaled tolerance accounts for sparser correspondences at
@@ -290,8 +295,8 @@ def object_motion(previous: np.ndarray, current: np.ndarray,
         good = np.isfinite(rv)
         moving = good & (rv > threshold)
         frac = float(moving.sum() / max(good.sum(), 1))
-        med = float(np.nanmedian(rv))
-        p75 = float(np.nanpercentile(rv, 75))
+        med = float(np.nanmedian(rv)) if good.any() else 0.0
+        p75 = float(np.nanpercentile(rv, 75)) if good.any() else 0.0
         # Require both a broad residual and a substantial fraction of points.
         dynamic = (p75 > base_threshold and frac >= 0.25)
         state = "DYNAMIC" if dynamic else "STATIC"
@@ -316,10 +321,11 @@ def object_motion(previous: np.ndarray, current: np.ndarray,
             o['bbox_max'] = hi.astype(float).tolist()
             o['size'] = (hi - lo).astype(float).tolist()
         else:
-            o['center'] = [float('nan')]*3
-            o['bbox_min'] = [float('nan')]*3
-            o['bbox_max'] = [float('nan')]*3
-            o['size'] = [float('nan')]*3
+            o['center'] = [0.0, 0.0, 0.0]
+            o['bbox_min'] = [0.0, 0.0, 0.0]
+            o['bbox_max'] = [0.0, 0.0, 0.0]
+            o['size'] = [0.0, 0.0, 0.0]
+    return residual, states, clusters
     return residual, states, clusters
 
 

@@ -9,7 +9,7 @@ sequential run starts playing before it has finished downloading.
 
 from __future__ import annotations
 
-import asyncio, json, queue, threading, traceback, uuid
+import asyncio, json, queue, threading, time, traceback, uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -56,7 +56,8 @@ def _run(job_id: str):
         if job['cancel']:
             break
         prev_for_motion = prev_fid if is_seq else None
-        print(f"[SEQUENTIAL] START frame={fid} prev={prev_for_motion} (frame {i+1}/{len(job['frames'])})", flush=True)
+        t_start = time.time()
+        print(f"[PROCESS START] frame={fid} worker=job_{job_id} prev={prev_for_motion} (frame {i+1}/{len(job['frames'])}) time={t_start:.3f}", flush=True)
         try:
             futs[fid].result()                 # its download is done (or failed)
             out = P.build(job['seq'], fid, job['source'], job['detail'],
@@ -69,14 +70,18 @@ def _run(job_id: str):
             with _lock:
                 job['done'][fid] = out
                 job['order'].append(fid)
-            print(f"[SEQUENTIAL] SUCCESS frame={fid}", flush=True)
+            t_end = time.time()
+            print(f"[PROCESS END]   frame={fid} worker=job_{job_id} SUCCESS time={t_end:.3f} duration={(t_end-t_start)*1000:.1f}ms", flush=True)
             ev = dict(type='frame', index=i, frame=fid, cached=out['cached'],
                       npts=out['npts'], ncells=out['ncells'],
                       drivable=out['drivable'], ms=out['ms'],
                       ego=out.get('ego'), motion=out.get('motion'), objects=out.get('objects', []))
         except Exception as e:                       # keep going; report it
-            print(f"[SEQUENTIAL] FAILED frame={fid} error={e}", flush=True)
+            t_end = time.time()
+            print(f"[PROCESS END]   frame={fid} worker=job_{job_id} FAILED time={t_end:.3f} error={e}", flush=True)
+            print(f"[FRAME FAILED] frame={fid} prev={prev_for_motion} stage=pipeline\nTraceback (most recent call last):", flush=True)
             traceback.print_exc()
+            prev_fid = fid
             with _lock:
                 job['errors'].append({'frame': fid, 'error': str(e)})
             ev = dict(type='error', index=i, frame=fid, error=str(e))
@@ -110,8 +115,8 @@ def sequences():
 
 @app.post('/api/jobs')
 def create(spec: JobSpec):
-    if spec.count < 1 or spec.count > 60:
-        raise HTTPException(400, 'count must be 1..60')
+    if spec.count < 1 or spec.count > 100:
+        raise HTTPException(400, 'count must be 1..100')
     if spec.seq not in P.SEQ_LEN:
         raise HTTPException(400, f'unknown sequence {spec.seq}')
     mode = (spec.mode or 'sequential').strip().lower()
