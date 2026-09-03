@@ -10,7 +10,7 @@ instant, but the cache is an optimisation, not the source of truth.
 
 from __future__ import annotations
 
-import base64, io, json, os, queue, sys, threading, time
+import base64, io, json, math, os, queue, sys, threading, time, traceback, uuid
 from pathlib import Path
 
 import numpy as np
@@ -108,25 +108,51 @@ class _borrow:
             q.put(self.z)
 
 
+_fetch_lock = threading.Lock()
+_frame_locks: dict[tuple, threading.Lock] = {}
+
+
+def _get_frame_lock(seq: str, frame: str) -> threading.Lock:
+    with _fetch_lock:
+        key = (seq, frame)
+        if key not in _frame_locks:
+            _frame_locks[key] = threading.Lock()
+        return _frame_locks[key]
+
+
 def fetch(seq: str, frame: str, want_truth: bool):
-    """make sure the raw files exist locally; pull them if not."""
+    """make sure the raw files exist locally; pull them atomically if not."""
     b = RAW / f'{seq}_{frame}.bin'
     lb = RAW / f'{seq}_{frame}.label'
     got = []
     t0 = time.perf_counter()
-    if not b.exists() or b.stat().st_size == 0:
-        with _borrow(FK.VEL) as z:
-            data = z.read(f'dataset/sequences/{seq}/velodyne/{frame}.bin')
-        b.write_bytes(data)          # read fully first: a failed read must not
-        got.append('velodyne')       # leave a 0-byte file behind
-    if want_truth and (not lb.exists() or lb.stat().st_size == 0):
-        try:
-            with _borrow(FK.LAB) as z:
-                data = z.read(f'dataset/sequences/{seq}/labels/{frame}.label')
-            lb.write_bytes(data)
-            got.append('labels')
-        except KeyError:
-            pass                     # sequences 11-21 have no public labels
+    flock = _get_frame_lock(seq, frame)
+    with flock:
+        if not b.exists() or b.stat().st_size == 0 or b.stat().st_size % 16 != 0:
+            print(f"[FETCH] frame={frame} source=REMOTE velodyne url={FK.VEL}", flush=True)
+            with _borrow(FK.VEL) as z:
+                data = z.read(f'dataset/sequences/{seq}/velodyne/{frame}.bin')
+            tmp = b.with_suffix(f'.tmp.{threading.get_ident()}.{uuid.uuid4().hex[:6]}')
+            tmp.write_bytes(data)
+            tmp.replace(b)
+            got.append('velodyne')
+        else:
+            print(f"[FETCH] frame={frame} source=LOCAL path={b.name} size={b.stat().st_size}", flush=True)
+
+        if want_truth and (not lb.exists() or lb.stat().st_size == 0 or lb.stat().st_size % 4 != 0):
+            try:
+                print(f"[FETCH] frame={frame} source=REMOTE labels url={FK.LAB}", flush=True)
+                with _borrow(FK.LAB) as z:
+                    data = z.read(f'dataset/sequences/{seq}/labels/{frame}.label')
+                tmp_lb = lb.with_suffix(f'.tmp.{threading.get_ident()}.{uuid.uuid4().hex[:6]}')
+                tmp_lb.write_bytes(data)
+                tmp_lb.replace(lb)
+                got.append('labels')
+            except KeyError:
+                pass
+        elif want_truth and lb.exists():
+            print(f"[FETCH] frame={frame} labels source=LOCAL path={lb.name} size={lb.stat().st_size}", flush=True)
+
     if got:
         _fetch_ms[(seq, frame)] = round((time.perf_counter() - t0) * 1000)
     return b, (lb if lb.exists() else None), got
@@ -309,6 +335,9 @@ def truth_objects(pts4: np.ndarray, labp: Path):
     moving_instances = static_instances = 0
     for k in range(ncl):
         q = idx[dense == k]
+        if not len(q):
+            cluster_classes[k] = 0
+            continue
         cls = int(det_cls[q[0]])
         cluster_classes[k] = cls
         gt_dyn = bool(np.mean(moving[q]) >= 0.5)
@@ -321,13 +350,30 @@ def truth_objects(pts4: np.ndarray, labp: Path):
             gt_moving_fraction=float(np.mean(moving[q])), points=int(len(q))))
 
     counts = {
-        'Car': int(np.sum(cluster_classes == 1)),
-        'Pedestrian': int(np.sum(cluster_classes == 2)),
-        'Cyclist': int(np.sum(cluster_classes == 3)),
+        'Car': int(np.sum(cluster_classes == 1)) if len(cluster_classes) else 0,
+        'Pedestrian': int(np.sum(cluster_classes == 2)) if len(cluster_classes) else 0,
+        'Cyclist': int(np.sum(cluster_classes == 3)) if len(cluster_classes) else 0,
     }
     return mapped.astype(np.int64), full_cl, cluster_classes, clusters_meta, dict(
         clusters=ncl, counts=counts, moving_instances=moving_instances,
         static_instances=static_instances)
+
+
+def sanitize_json_obj(obj):
+    if isinstance(obj, float):
+        return 0.0 if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: sanitize_json_obj(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_json_obj(v) for v in obj]
+    if isinstance(obj, np.floating):
+        f = float(obj)
+        return 0.0 if (math.isnan(f) or math.isinf(f)) else f
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return sanitize_json_obj(obj.tolist())
+    return obj
 
 
 def build(seq: str, frame: str, source: str = 'model', mult: int = SURF_MULT,
@@ -348,175 +394,197 @@ def build(seq: str, frame: str, source: str = 'model', mult: int = SURF_MULT,
             d['cached'] = True
             return d
 
-    t0 = time.perf_counter()
-    binp, labp, fetched = fetch(seq, frame, want_truth=(source == 'truth'))
-    # if a prefetch thread already downloaded it, credit that thread's time
-    t_fetch = max(time.perf_counter() - t0,
-                  _fetch_ms.pop((seq, frame), 0) / 1000)
+    stage = "fetch"
+    try:
+        t0 = time.perf_counter()
+        binp, labp, fetched = fetch(seq, frame, want_truth=(source == 'truth'))
+        t_fetch = max(time.perf_counter() - t0,
+                      _fetch_ms.pop((seq, frame), 0) / 1000)
 
-    pts4 = np.fromfile(binp, np.float32).reshape(-1, 4)
+        pts4 = np.fromfile(binp, np.float32).reshape(-1, 4)
+        raw_pts_count = len(pts4)
 
-    # Temporal layer: estimate ego translation directly from consecutive
-    # LiDAR scans.  No KITTI pose file and no semantic labels are involved.
-    # This first stage is intentionally planar/translation-only; later stages
-    # will add yaw/6-DoF registration and object residuals.
-    ego = None
-    e = None
-    if prev_frame is not None:
-        prev_bin = RAW / f'{seq}_{prev_frame}.bin'
-        if prev_bin.exists() and prev_bin.stat().st_size:
-            prev_pts4 = np.fromfile(prev_bin, np.float32).reshape(-1, 4)
-            e = ego_motion.estimate(prev_pts4, pts4, dt=motion_dt,
-                                    resolution=0.25, max_range=g.maxrange)
-            ego = dict(tx=e.tx, ty=e.ty, yaw=e.yaw, yaw_deg=e.yaw_deg,
-                        speed_mps=e.speed_mps, speed_kmh=e.speed_kmh,
-                        confidence=e.confidence, shift_px=list(e.shift_px),
-                        resolution=e.resolution, iterations=e.iterations,
-                        rmse=e.rmse, inlier_ratio=e.inlier_ratio,
-                        method=e.method)
+        stage = "ego_motion"
+        ego = None
+        e = None
+        if prev_frame is not None:
+            prev_bin = RAW / f'{seq}_{prev_frame}.bin'
+            if prev_bin.exists() and prev_bin.stat().st_size and prev_bin.stat().st_size % 16 == 0:
+                prev_pts4 = np.fromfile(prev_bin, np.float32).reshape(-1, 4)
+                if len(prev_pts4) > 0 and len(pts4) > 0:
+                    e = ego_motion.estimate(prev_pts4, pts4, dt=motion_dt,
+                                            resolution=0.25, max_range=g.maxrange)
+                    ego = dict(tx=e.tx, ty=e.ty, yaw=e.yaw, yaw_deg=e.yaw_deg,
+                                speed_mps=e.speed_mps, speed_kmh=e.speed_kmh,
+                                confidence=e.confidence, shift_px=list(e.shift_px),
+                                resolution=e.resolution, iterations=e.iterations,
+                                rmse=e.rmse, inlier_ratio=e.inlier_ratio,
+                                method=e.method)
 
-    info, prov = {}, None
-    cluster_ids = None
-    cluster_classes = None
-    gt_meta = []
-    t_motion = 0.0
-    t0 = time.perf_counter()
-    if source == 'truth':
-        if labp is None:
-            raise ValueError(f'no ground-truth labels published for sequence {seq}')
-        lab, cluster_ids, cluster_classes, gt_meta, gt_info = truth_objects(pts4, labp)
-        info.update(gt_info)
-    else:
-        import predict
-        m_, cfg = model()
-        lab, info, prov, cluster_ids, cluster_classes = predict.predict(
-            pts4, m_, cfg, with_prov=True, with_clusters=True)
-    t_label = time.perf_counter() - t0
-
-    # Stage 3: ego-compensated temporal residual. This is intentionally a
-    # geometric baseline: no SemanticKITTI labels and no motion network.
-    object_motion = None
-    if ego is not None and cluster_ids is not None and cluster_classes is not None:
-        prev_bin = RAW / f'{seq}_{prev_frame}.bin'
-        if prev_bin.exists() and prev_bin.stat().st_size:
-            prev_pts4 = np.fromfile(prev_bin, np.float32).reshape(-1, 4)
-            tm0 = time.perf_counter()
-            eobj = ego_motion.object_motion(
-                prev_pts4, pts4, e, cluster_ids, cluster_classes)
-            t_motion = time.perf_counter() - tm0
-            residual, point_motion, object_motion = eobj
-            if source == 'truth':
-                gt_by_id = {int(o['id']): o for o in gt_meta}
-                for o in object_motion:
-                    gm = gt_by_id.get(int(o['id']))
-                    if gm:
-                        o['gt_state'] = gm['gt_state']
-                        o['gt_moving_fraction'] = gm['gt_moving_fraction']
-            # Stage 4: add persistent IDs and ego-compensated relative velocity.
-            object_motion, next_track_id = ego_motion.track_objects(
-                previous_objects, object_motion, e, motion_dt, next_track_id=next_track_id)
-            # Stage 6: optional tiny learned refinement. Geometry remains the
-            # fallback and supplies the features; the MLP only runs per object.
-            mlp = motion_model()
-            if mlp is not None:
-                object_motion = motion_mlp.refine(object_motion, ego, mlp)
+        stage = "labels_and_clustering"
+        info, prov = {}, None
+        cluster_ids = None
+        cluster_classes = None
+        gt_meta = []
+        t_motion = 0.0
+        t0 = time.perf_counter()
+        if source == 'truth':
+            if labp is None:
+                raise ValueError(f'no ground-truth labels published for sequence {seq}')
+            lab, cluster_ids, cluster_classes, gt_meta, gt_info = truth_objects(pts4, labp)
+            info.update(gt_info)
         else:
-            residual = np.full(len(pts4), np.nan, np.float32)
-            point_motion = np.full(len(pts4), 255, np.uint8)
-    else:
+            import predict
+            m_, cfg = model()
+            lab, info, prov, cluster_ids, cluster_classes = predict.predict(
+                pts4, m_, cfg, with_prov=True, with_clusters=True)
+        t_label = time.perf_counter() - t0
+
+        stage = "object_motion_and_tracking"
+        object_motion = None
         residual = np.full(len(pts4), np.nan, np.float32)
         point_motion = np.full(len(pts4), 255, np.uint8)
+        if ego is not None and cluster_ids is not None and cluster_classes is not None and len(cluster_classes) > 0:
+            prev_bin = RAW / f'{seq}_{prev_frame}.bin'
+            if prev_bin.exists() and prev_bin.stat().st_size and prev_bin.stat().st_size % 16 == 0:
+                prev_pts4 = np.fromfile(prev_bin, np.float32).reshape(-1, 4)
+                if len(prev_pts4) > 0 and len(pts4) > 0:
+                    tm0 = time.perf_counter()
+                    eobj = ego_motion.object_motion(
+                        prev_pts4, pts4, e, cluster_ids, cluster_classes)
+                    t_motion = time.perf_counter() - tm0
+                    residual, point_motion, object_motion = eobj
+                    if source == 'truth':
+                        gt_by_id = {int(o['id']): o for o in gt_meta}
+                        for o in object_motion:
+                            gm = gt_by_id.get(int(o['id']))
+                            if gm:
+                                o['gt_state'] = gm['gt_state']
+                                o['gt_moving_fraction'] = gm['gt_moving_fraction']
+                    object_motion, next_track_id = ego_motion.track_objects(
+                        previous_objects, object_motion, e, motion_dt, next_track_id=next_track_id)
+                    mlp = motion_model()
+                    if mlp is not None:
+                        object_motion = motion_mlp.refine(object_motion, ego, mlp)
 
-    x, y, z = (pts4[:, i].astype(float) for i in range(3))
-    k = np.hypot(x, y) < g.maxrange
-    x, y, z, lab = x[k], y[k], z[k], lab[k].astype(np.int64)
+        stage = "grid_construction"
+        x, y, z = (pts4[:, i].astype(float) for i in range(3))
+        k = np.hypot(x, y) < g.maxrange
+        x, y, z, lab = x[k], y[k], z[k], lab[k].astype(np.int64)
 
-    t0 = time.perf_counter()
-    m = g.build(np.stack([x, y, z], 1), lab)
-    t_grid = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        m = g.build(np.stack([x, y, z], 1), lab)
+        t_grid = time.perf_counter() - t0
 
-    extra = {}
-    if prov is not None:
-        extra['det'] = cell_provenance(m, x, y, prov[k])
+        stage = "motion_cells_and_surface"
+        extra = {}
+        if prov is not None:
+            extra['det'] = cell_provenance(m, x, y, prov[k])
 
-    motion_cells = np.full(len(m['n']), 255, np.uint8)
-    if object_motion is not None:
-        pm = point_motion[k]
-        objp = np.isin(lab, [g.car, g.ped]) & (pm != 255)
-        if np.any(objp):
-            ix = np.floor(x / g.res0).astype(np.int64)
-            iy = np.floor(y / g.res0).astype(np.int64)
-            lv = g.blocklevel(ix, iy)
-            pk = ((lv << 62) | (((ix >> lv) & 0x7fffffff) << 31)
-                  | ((iy >> lv) & 0x7fffffff))
-            ck = ((m['lvl'].astype(np.int64) << 62)
-                  | ((m['ix'] & 0x7fffffff) << 31) | (m['iy'] & 0x7fffffff))
-            ci = np.searchsorted(ck, pk)
-            ok = objp & (ci < len(ck))
-            ok &= ck[np.minimum(ci, len(ck)-1)] == pk
-            dc = np.zeros(len(ck), np.int32); sc = np.zeros(len(ck), np.int32)
-            np.add.at(dc, ci[ok & (pm == 1)], 1)
-            np.add.at(sc, ci[ok & (pm == 0)], 1)
-            motion_cells[(dc == 0) & (sc > 0)] = 0
-            motion_cells[(dc > sc) & (dc > 0)] = 1
-        extra['motion'] = motion_cells
+        motion_cells = np.full(len(m['n']), 255, np.uint8)
+        if object_motion is not None:
+            pm = point_motion[k]
+            objp = np.isin(lab, [g.car, g.ped]) & (pm != 255)
+            if np.any(objp) and len(m['n']) > 0:
+                ix = np.floor(x / g.res0).astype(np.int64)
+                iy = np.floor(y / g.res0).astype(np.int64)
+                lv = g.blocklevel(ix, iy)
+                pk = ((lv << 62) | (((ix >> lv) & 0x7fffffff) << 31)
+                      | ((iy >> lv) & 0x7fffffff))
+                ck = ((m['lvl'].astype(np.int64) << 62)
+                      | ((m['ix'] & 0x7fffffff) << 31) | (m['iy'] & 0x7fffffff))
+                ci = np.searchsorted(ck, pk)
+                ok = objp & (ci < len(ck))
+                if len(ck) > 0:
+                    ok &= ck[np.minimum(ci, len(ck)-1)] == pk
+                else:
+                    ok = np.zeros(len(ci), bool)
+                dc = np.zeros(len(ck), np.int32); sc = np.zeros(len(ck), np.int32)
+                np.add.at(dc, ci[ok & (pm == 1)], 1)
+                np.add.at(sc, ci[ok & (pm == 0)], 1)
+                motion_cells[(dc == 0) & (sc > 0)] = 0
+                motion_cells[(dc > sc) & (dc > 0)] = 1
+            extra['motion'] = motion_cells
 
-    t0 = time.perf_counter()
-    srf = surface_json(m, x, y, z, lab, mult=mult, quiet=True, extra=extra)
-    t_surf = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        srf = surface_json(m, x, y, z, lab, mult=mult, quiet=True, extra=extra)
+        t_surf = time.perf_counter() - t0
 
-    s = g.memstats(m)
-    out = dict(
-        seq=seq, frame=frame, source=source,
-        tiers=srf['tiers'], zlo=srf['zlo'], zhi=srf['zhi'],
-        zglo=float(min(np.frombuffer(base64.b64decode(t['zgnd']), np.int16).min()
-                       for t in srf['tiers'])) / 1000,
-        zghi=float(max(np.frombuffer(base64.b64decode(t['zgnd']), np.int16).max()
-                       for t in srf['tiers'])) / 1000,
-        npts=int(k.sum()), ncells=int(len(m['n'])), fine=int(s['fine']),
-        uniform=int(s['uniform']),
-        drivable=round(100 * float(m['trav'].mean()), 1),
-        lvlcount=[int((m['lvl'] == i).sum()) for i in range(4)],
-        clscount=[int(c) for c in np.bincount(m['cls'], minlength=8)],
-        provcount=info.get('provcount', {}),
-        clusters=info.get('clusters', 0),
-        cars=info.get('counts', {}).get('Car', 0),
-        vru=(info.get('counts', {}).get('Pedestrian', 0)
-             + info.get('counts', {}).get('Cyclist', 0)),
-        ms=dict(fetch=round(t_fetch*1000), label=round(t_label*1000),
-                motion=round(t_motion*1000), grid=round(t_grid*1000), surface=round(t_surf*1000)),
-        fetched=fetched, cached=False,
-        ego=ego,
-        objects=object_motion or [],
-        motion=dict(dynamic_points=int(np.sum(point_motion[k] == 1)),
-                    static_points=int(np.sum(point_motion[k] == 0)),
-                    unknown_points=int(np.sum(point_motion[k] == 255)),
-                    dynamic_objects=int(sum(o['state'] == 'DYNAMIC' for o in (object_motion or []))),
-                    static_objects=int(sum(o['state'] == 'STATIC' for o in (object_motion or []))),
-                    unknown_objects=int(sum(o['state'] == 'UNKNOWN' for o in (object_motion or []))),
-                    mlp_enabled=bool(motion_model() is not None),
-                    mlp_dynamic_objects=int(sum(o.get('mlp_state') == 'DYNAMIC' for o in (object_motion or []))),
-                    mlp_overrides=int(sum(bool(o.get('mlp_override')) for o in (object_motion or []))),
-                    gt_dynamic_objects=int(sum(o.get('gt_state') == 'DYNAMIC' for o in (object_motion or []))),
-                    gt_static_objects=int(sum(o.get('gt_state') == 'STATIC' for o in (object_motion or [])))),
-        next_track_id=next_track_id,
-        v=CACHE_V,
-        mult=mult,
-        cam=_safe_calib(seq),
-        proj=_safe_project(seq, np.stack([x, y, z], 1), lab),
-    )
-    key.write_text(json.dumps(out, separators=(',', ':')))
-    return out
+        stage = "format_output"
+        s = g.memstats(m)
+        zg_bufs = [np.frombuffer(base64.b64decode(t['zgnd']), np.int16) for t in srf['tiers']]
+        zg_valid = [b for b in zg_bufs if len(b) > 0]
+        zglo = float(min(b.min() for b in zg_valid)) / 1000 if zg_valid else 0.0
+        zghi = float(max(b.max() for b in zg_valid)) / 1000 if zg_valid else 0.0
+        out = dict(
+            seq=seq, frame=frame, source=source,
+            tiers=srf['tiers'], zlo=srf['zlo'], zhi=srf['zhi'],
+            zglo=zglo, zghi=zghi,
+            npts=int(k.sum()), ncells=int(len(m['n'])), fine=int(s['fine']),
+            uniform=int(s['uniform']),
+            drivable=round(100 * float(m['trav'].mean()), 1) if len(m['trav']) > 0 else 0.0,
+            lvlcount=[int((m['lvl'] == i).sum()) for i in range(4)],
+            clscount=[int(c) for c in np.bincount(m['cls'], minlength=8)] if len(m['cls']) > 0 else [0]*8,
+            provcount=info.get('provcount', {}),
+            clusters=info.get('clusters', 0),
+            cars=info.get('counts', {}).get('Car', 0),
+            vru=(info.get('counts', {}).get('Pedestrian', 0)
+                 + info.get('counts', {}).get('Cyclist', 0)),
+            ms=dict(fetch=round(t_fetch*1000), label=round(t_label*1000),
+                    motion=round(t_motion*1000), grid=round(t_grid*1000), surface=round(t_surf*1000)),
+            fetched=fetched, cached=False,
+            ego=ego,
+            objects=object_motion or [],
+            motion=dict(dynamic_points=int(np.sum(point_motion[k] == 1)),
+                        static_points=int(np.sum(point_motion[k] == 0)),
+                        unknown_points=int(np.sum(point_motion[k] == 255)),
+                        dynamic_objects=int(sum(o['state'] == 'DYNAMIC' for o in (object_motion or []))),
+                        static_objects=int(sum(o['state'] == 'STATIC' for o in (object_motion or []))),
+                        unknown_objects=int(sum(o['state'] == 'UNKNOWN' for o in (object_motion or []))),
+                        mlp_enabled=bool(motion_model() is not None),
+                        mlp_dynamic_objects=int(sum(o.get('mlp_state') == 'DYNAMIC' for o in (object_motion or []))),
+                        mlp_overrides=int(sum(bool(o.get('mlp_override')) for o in (object_motion or []))),
+                        gt_dynamic_objects=int(sum(o.get('gt_state') == 'DYNAMIC' for o in (object_motion or []))),
+                        gt_static_objects=int(sum(o.get('gt_state') == 'STATIC' for o in (object_motion or [])))),
+            next_track_id=next_track_id,
+            v=CACHE_V,
+            mult=mult,
+            cam=_safe_calib(seq),
+            proj=_safe_project(seq, np.stack([x, y, z], 1), lab),
+        )
+        out = sanitize_json_obj(out)
+        key.write_text(json.dumps(out, separators=(',', ':'), allow_nan=False))
+
+        print(f"[FRAME {frame}]\n"
+              f"  fetch: OK (pts={raw_pts_count})\n"
+              f"  raw_points: {raw_pts_count}\n"
+              f"  labels: OK\n"
+              f"  labelled_points: {len(lab)}\n"
+              f"  clusters: {info.get('clusters', 0)}\n"
+              f"  detector_objects: {len(object_motion or [])}\n"
+              f"  previous_objects: {len(previous_objects or [])}\n"
+              f"  current_objects: {len(object_motion or [])}\n"
+              f"  grid_cells: {len(m['n'])}\n"
+              f"  final_result: OK", flush=True)
+        return out
+    except Exception as exc:
+        print(f"[FRAME FAILED] frame={frame} prev={prev_frame} stage={stage}\n"
+              f"Traceback (most recent call last):", flush=True)
+        traceback.print_exc()
+        raise
 
 
-def frame_ids(seq: str, mode: str, start: int, count: int, stride: int, seed: int = 0):
+def frame_ids(seq: str, mode: str, start: int, count: int, stride: int = 1, seed: int = 0):
     """sequential = consecutive motion; random = scattered across the sequence."""
     n = SEQ_LEN.get(seq, 1000)
-    if mode == 'random':
+    m = (mode or 'sequential').strip().lower()
+    if m == 'random':
         rng = np.random.default_rng(seed)
         ids = sorted(rng.choice(n, size=min(count, n), replace=False).tolist())
     else:
-        ids = [start + i*stride for i in range(count) if start + i*stride < n]
+        # Sequential mode MUST ALWAYS process consecutive frames (start, start+1, start+2, ...)
+        # Stride MUST NOT affect sequential mode under any circumstances.
+        ids = [start + i for i in range(count) if start + i < n]
     return [f'{i:06d}' for i in ids]
 
 

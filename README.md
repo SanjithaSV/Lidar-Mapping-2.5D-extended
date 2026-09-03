@@ -47,8 +47,8 @@ This repository provides the complete, authoritative Stage 6C implementation for
 ├── kitti.py                     # KITTI dataset parser and projection helpers
 ├── fetch_kitti.py               # Asynchronous remote scan fetching
 ├── requirements.txt             # Python package dependencies
-├── STAGE3.md - STAGE6B_GT_FIX.md# Detailed stage design and validation documentation
-└── REPO_HANDOFF.md              # Stage 6C handoff notes
+├── DOCUMENTATION.md             # Complete canonical project technical documentation
+└── README.md                    # Project landing page and quick-start guide
 ```
 
 ---

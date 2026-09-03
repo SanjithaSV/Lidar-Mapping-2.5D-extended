@@ -6,7 +6,7 @@ enough to list the central directory and inflate single members. we pull
 ~2 mb of velodyne and ~0.5 mb of labels per frame instead of the whole set.
 """
 
-import io, os, sys, zipfile, urllib.request
+import io, os, sys, zipfile, urllib.request, threading
 
 VEL = 'https://s3.eu-central-1.amazonaws.com/avg-kitti/data_odometry_velodyne.zip'
 LAB = 'http://www.semantic-kitti.org/assets/data_odometry_labels.zip'
@@ -18,6 +18,7 @@ class httpfile(io.RawIOBase):
 
     def __init__(self, url, blk=1 << 18):
         self.url, self.blk, self.pos, self.cache = url, blk, 0, {}
+        self._lock = threading.Lock()
         r = urllib.request.Request(url, method='HEAD')
         with urllib.request.urlopen(r, timeout=60) as h:
             self.size = int(h.headers['Content-Length'])
@@ -29,11 +30,13 @@ class httpfile(io.RawIOBase):
         return True
 
     def tell(self):
-        return self.pos
+        with self._lock:
+            return self.pos
 
     def seek(self, off, whence=0):
-        self.pos = off if whence == 0 else self.pos + off if whence == 1 else self.size + off
-        return self.pos
+        with self._lock:
+            self.pos = off if whence == 0 else self.pos + off if whence == 1 else self.size + off
+            return self.pos
 
     def _block(self, b):
         c = self.cache.get(b)
@@ -53,19 +56,20 @@ class httpfile(io.RawIOBase):
         return c
 
     def read(self, n=-1):
-        if n < 0:
-            n = self.size - self.pos
-        n = min(n, self.size - self.pos)
-        out = bytearray()
-        while n > 0:
-            b, o = divmod(self.pos, self.blk)
-            chunk = self._block(b)[o:o + n]
-            if not chunk:
-                break
-            out += chunk
-            self.pos += len(chunk)
-            n -= len(chunk)
-        return bytes(out)
+        with self._lock:
+            if n < 0:
+                n = self.size - self.pos
+            n = min(n, self.size - self.pos)
+            out = bytearray()
+            while n > 0:
+                b, o = divmod(self.pos, self.blk)
+                chunk = self._block(b)[o:o + n]
+                if not chunk:
+                    break
+                out += chunk
+                self.pos += len(chunk)
+                n -= len(chunk)
+            return bytes(out)
 
 
 def grab(url, members, dest):

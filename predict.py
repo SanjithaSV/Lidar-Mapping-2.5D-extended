@@ -158,10 +158,19 @@ def predict(pts4, model, cfg, batch=256, seed=0, with_prov=False, with_clusters=
     last = np.searchsorted(cs, np.arange(ncl), side='right')
     P = cfg.n_points
     sel = np.empty((ncl, P), np.int64)
+    valid_k = []
     for k in range(ncl):
         idx = order[first[k]:last[k]]
+        if len(idx) == 0:
+            continue
         sel[k] = (rng.choice(idx, P, replace=False) if len(idx) >= P
                   else rng.choice(idx, P, replace=True))
+        valid_k.append(k)
+
+    if not valid_k:
+        empty = dict(ground=int(is_ground.sum()), clusters=0, counts={})
+        return ((lab, empty, prov, np.full(N, -1, np.int64), np.empty(0, np.int64))
+                if with_clusters else ((lab, empty, prov) if with_prov else (lab, empty)))
 
     xyz = obj[sel][:, :, :3].astype(np.float64)
     inten = obj[sel][:, :, 3].astype(np.float64)

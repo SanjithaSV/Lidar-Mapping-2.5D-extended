@@ -9,7 +9,7 @@ sequential run starts playing before it has finished downloading.
 
 from __future__ import annotations
 
-import asyncio, json, queue, threading, traceback, uuid
+import asyncio, json, queue, threading, time, traceback, uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -41,12 +41,8 @@ class JobSpec(BaseModel):
 
 def _run(job_id: str):
     job = JOBS[job_id]
-    # start every download at once, three at a time, while the main loop
-    # labels and converts whatever has landed. fetching dominates a cold run
-    # (~38 s a frame) and it is pure I/O, so overlapping it is nearly free.
     want_truth = job['source'] == 'truth'
-    # photos are pulled on a separate, lower-priority lane so a slow image
-    # never delays the map it belongs to
+    is_seq = (job['spec'].get('mode') or 'sequential').strip().lower() == 'sequential'
     if job['camera']:
         for f in job['frames']:
             job['cam_pool'].submit(P.prefetch_image, job['seq'], f)
@@ -59,34 +55,55 @@ def _run(job_id: str):
     for i, fid in enumerate(job['frames']):
         if job['cancel']:
             break
+        prev_for_motion = prev_fid if is_seq else None
+        t_start = time.time()
+        print(f"[PROCESS START] frame={fid} worker=job_{job_id} prev={prev_for_motion} (frame {i+1}/{len(job['frames'])}) time={t_start:.3f}", flush=True)
         try:
             futs[fid].result()                 # its download is done (or failed)
-            prev_for_motion = prev_fid if job['spec']['mode'] == 'sequential' else None
             out = P.build(job['seq'], fid, job['source'], job['detail'],
                           prev_frame=prev_for_motion, previous_objects=prev_objects,
                           next_track_id=next_track_id)
-            if job['spec']['mode'] == 'sequential':
+            if is_seq:
                 prev_objects = out.get('objects', [])
                 next_track_id = int(out.get('next_track_id', next_track_id))
             prev_fid = fid
             with _lock:
                 job['done'][fid] = out
                 job['order'].append(fid)
+            t_end = time.time()
+            print(f"[PROCESS END]   frame={fid} worker=job_{job_id} SUCCESS time={t_end:.3f} duration={(t_end-t_start)*1000:.1f}ms", flush=True)
             ev = dict(type='frame', index=i, frame=fid, cached=out['cached'],
                       npts=out['npts'], ncells=out['ncells'],
                       drivable=out['drivable'], ms=out['ms'],
                       ego=out.get('ego'), motion=out.get('motion'), objects=out.get('objects', []))
         except Exception as e:                       # keep going; report it
+            t_end = time.time()
+            print(f"[PROCESS END]   frame={fid} worker=job_{job_id} FAILED time={t_end:.3f} error={e}", flush=True)
+            print(f"[FRAME FAILED] frame={fid} prev={prev_for_motion} stage=pipeline\nTraceback (most recent call last):", flush=True)
             traceback.print_exc()
+            prev_fid = fid
             with _lock:
                 job['errors'].append({'frame': fid, 'error': str(e)})
             ev = dict(type='error', index=i, frame=fid, error=str(e))
-        job['events'].put(ev)
+        ev = P.sanitize_json_obj(ev)
+        with _lock:
+            job['history'].append(ev)
+            for q in list(job.get('listeners', [])):
+                try:
+                    q.put_nowait(ev)
+                except Exception:
+                    pass
     pool.shutdown(wait=False, cancel_futures=True)
     job['cam_pool'].shutdown(wait=False, cancel_futures=True)
-    job['state'] = 'cancelled' if job['cancel'] else 'done'
-    job['events'].put(dict(type='end', state=job['state'],
-                           errors=len(job['errors'])))
+    with _lock:
+        job['state'] = 'cancelled' if job['cancel'] else 'done'
+        end_ev = dict(type='end', state=job['state'], errors=len(job['errors']))
+        job['history'].append(end_ev)
+        for q in list(job.get('listeners', [])):
+            try:
+                q.put_nowait(end_ev)
+            except Exception:
+                pass
 
 
 @app.get('/api/sequences')
@@ -98,23 +115,30 @@ def sequences():
 
 @app.post('/api/jobs')
 def create(spec: JobSpec):
-    if spec.count < 1 or spec.count > 60:
-        raise HTTPException(400, 'count must be 1..60')
+    if spec.count < 1 or spec.count > 100:
+        raise HTTPException(400, 'count must be 1..100')
+    if spec.seq not in P.SEQ_LEN:
+        raise HTTPException(400, f'unknown sequence {spec.seq}')
+    mode = (spec.mode or 'sequential').strip().lower()
     # Sequential mode is always truly consecutive. The stride field is
     # intentionally ignored here so a sequential job can never silently
     # skip frames (e.g. 000000 -> 000100). Random mode remains sampled.
-    stride = 1 if spec.mode == 'sequential' else max(1, spec.stride)
-    frames = P.frame_ids(spec.seq, spec.mode, spec.start, spec.count,
+    stride = 1 if mode == 'sequential' else max(1, spec.stride)
+    frames = P.frame_ids(spec.seq, mode, spec.start, spec.count,
                          stride, spec.seed)
     if not frames:
         raise HTTPException(400, 'that range contains no frames')
     jid = uuid.uuid4().hex[:12]
+    spec_dict = spec.model_dump()
+    spec_dict['mode'] = mode
+    spec_dict['stride'] = stride
     JOBS[jid] = dict(id=jid, seq=spec.seq, source=spec.source, frames=frames,
                      camera=spec.camera, detail=max(1, min(4, spec.detail)),
                      done={}, order=[], errors=[],
-                     events=queue.Queue(), state='running', cancel=False,
+                     history=[], listeners=[],
+                     state='running', cancel=False,
                      cam_pool=ThreadPoolExecutor(max_workers=2, thread_name_prefix='cam'),
-                     spec=spec.model_dump())
+                     spec=spec_dict)
     threading.Thread(target=_run, args=(jid,), daemon=True).start()
     return {'id': jid, 'frames': frames, 'state': 'running'}
 
@@ -144,17 +168,38 @@ async def events(jid: str):
     if not j:
         raise HTTPException(404, 'no such job')
 
+    q = queue.Queue()
+    with _lock:
+        past = list(j.get('history', []))
+        is_done = j['state'] in ('done', 'cancelled')
+        if not is_done:
+            j.setdefault('listeners', []).append(q)
+
     async def gen():
         loop = asyncio.get_event_loop()
-        while True:
-            try:
-                ev = await loop.run_in_executor(None, j['events'].get, True, 30)
-            except queue.Empty:
-                yield ': keepalive\n\n'
-                continue
-            yield f'data: {json.dumps(ev)}\n\n'
-            if ev.get('type') == 'end':
+        try:
+            # Replay all past events so reconnecting or delayed listeners never miss anything
+            for ev in past:
+                yield f'data: {json.dumps(ev, allow_nan=False)}\n\n'
+                if ev.get('type') == 'end':
+                    return
+            if is_done:
                 return
+
+            while True:
+                try:
+                    ev = await loop.run_in_executor(None, q.get, True, 30)
+                except queue.Empty:
+                    yield ': keepalive\n\n'
+                    continue
+                yield f'data: {json.dumps(ev, allow_nan=False)}\n\n'
+                if ev.get('type') == 'end':
+                    return
+        finally:
+            with _lock:
+                listeners = j.get('listeners', [])
+                if q in listeners:
+                    listeners.remove(q)
 
     return StreamingResponse(gen(), media_type='text/event-stream',
                              headers={'Cache-Control': 'no-cache',
@@ -189,6 +234,24 @@ def image(jid: str, fid: str):
 def health():
     return {'ok': True, 'cached_frames': len(list(P.OUT.glob('*.json'))),
             'cached_raw': len(list(P.RAW.glob('*.bin')))}
+
+
+@app.get('/')
+def serve_index():
+    return FileResponse(ROOT / 'web' / 'index.html', media_type='text/html',
+                        headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
+
+
+@app.get('/app.js')
+def serve_js():
+    return FileResponse(ROOT / 'web' / 'app.js', media_type='application/javascript',
+                        headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
+
+
+@app.get('/style.css')
+def serve_css():
+    return FileResponse(ROOT / 'web' / 'style.css', media_type='text/css',
+                        headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
 
 
 app.mount('/', StaticFiles(directory=ROOT / 'web', html=True), name='web')

@@ -68,8 +68,18 @@ def surface_json(m, x, y, z, lab, mult=1, quiet=False, extra=None):
         nk = ((lv << 62)
               | (((np.floor(X/g.res0).astype(np.int64) >> lv) & 0x7fffffff) << 31)
               | ((np.floor(Y/g.res0).astype(np.int64) >> lv) & 0x7fffffff))
-        j = np.minimum(np.searchsorted(ckey, nk), len(ckey)-1)
-        hit = (ckey[j] == nk).reshape(ny, nx)
+        if len(ckey) == 0:
+            hit = np.zeros((ny, nx), bool)
+            top = np.full((ny, nx), np.nan, np.float32)
+            cls = np.full((ny, nx), 7, np.uint8)
+            trav = np.zeros((ny, nx), np.uint8)
+        else:
+            j = np.minimum(np.searchsorted(ckey, nk), len(ckey)-1)
+            hit = (ckey[j] == nk).reshape(ny, nx)
+            top = np.where(hit, m['zmax'][j].reshape(ny, nx), np.nan)
+            cls = np.where(hit, m['cls'][j].reshape(ny, nx), 7).astype(np.uint8)
+            trav = np.where(hit, m['trav'][j].reshape(ny, nx), 0).astype(np.uint8)
+
         zgnd = g.sample(rast, gox, goy, X, Y).reshape(ny, nx)
         # how far this node is from a real ground return. beyond gnear the
         # raster is extrapolation, not terrain -- the same rule traversable()
@@ -77,7 +87,6 @@ def surface_json(m, x, y, z, lab, mult=1, quiet=False, extra=None):
         # those quads rather than drawing an invented plane.
         gdist = g.sample(dist, gox, goy, X, Y).reshape(ny, nx)
         known = gdist < g.gnear
-        top = np.where(hit, m['zmax'][j].reshape(ny, nx), np.nan)
         # a node with no cell is unmeasured, not "at ground level". fill from
         # the nearest real observation as far as one can honestly reach, then
         # fall back to terrain -- otherwise a wall alternates with the road
@@ -92,8 +101,6 @@ def surface_json(m, x, y, z, lab, mult=1, quiet=False, extra=None):
         # neighbour's class and drivability too. filling the height but leaving
         # the class at `other` puts a grey roof on a purple car -- the surface
         # says "car" and the colour says "not a car" about the same node.
-        cls = np.where(hit, m['cls'][j].reshape(ny, nx), 7).astype(np.uint8)
-        trav = np.where(hit, m['trav'][j].reshape(ny, nx), 0).astype(np.uint8)
         cls = np.where(near, cls[tuple(idx)], cls)
         trav = np.where(near, trav[tuple(idx)], trav)
         flag = (hit.astype(np.uint8) | (trav << 1) | (known.astype(np.uint8) << 2))
@@ -103,18 +110,23 @@ def surface_json(m, x, y, z, lab, mult=1, quiet=False, extra=None):
                     cls=b64(cls), flag=b64(flag))
         # any extra per-cell byte channel, resolved to the node's owning cell
         for name, arr in (extra or {}).items():
-            tier[name] = b64(np.where(hit, arr[j].reshape(ny, nx), 255).astype(np.uint8))
+            if len(arr) == 0 or len(ckey) == 0:
+                tier[name] = b64(np.full((ny, nx), 255, np.uint8))
+            else:
+                tier[name] = b64(np.where(hit, arr[j].reshape(ny, nx), 255).astype(np.uint8))
         tiers.append(tier)
         tot += nx*ny
         if not quiet:
             print(f'  tier {t} {res*100:4.0f} cm  {nx:4d}x{ny:4d}={nx*ny:8d}  '
                   f'observed {100*hit.mean():4.1f}%  terrain known {100*known.mean():4.1f}%')
-    zt = np.concatenate([np.frombuffer(base64.b64decode(t['ztop']), np.int16)
-                         for t in tiers]) / 1000
+    bufs = [np.frombuffer(base64.b64decode(t['ztop']), np.int16) for t in tiers]
+    valid_bufs = [b for b in bufs if len(b) > 0]
+    zt = (np.concatenate(valid_bufs) / 1000) if valid_bufs else np.array([0.0])
     if not quiet:
         print(f'  {tot:,} nodes')
-    return dict(tiers=tiers, zlo=float(np.percentile(zt, .5)),
-                zhi=float(np.percentile(zt, 99.5)))
+    zlo = float(np.percentile(zt, .5)) if len(zt) else 0.0
+    zhi = float(np.percentile(zt, 99.5)) if len(zt) else 0.0
+    return dict(tiers=tiers, zlo=zlo, zhi=zhi)
 
 
 def autoviews(m):
