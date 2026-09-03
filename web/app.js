@@ -257,32 +257,47 @@ const redraw=()=>{ if(pend)return; pend=true; requestAnimationFrame(()=>{pend=fa
 function info(){
   const d = frameOf(S.frames[S.cur]);
   if (!d){ $('kv').innerHTML='<dt>&mdash;</dt><dd>&mdash;</dd>'; return; }
+  const detectedObjs = (d.cars || 0) + (d.vru || 0);
   const rows = [
     ['points in', fmt(d.npts)],
     ['cells at 5 cm', fmt(d.fine)],
     ['adaptive cells', fmt(d.ncells)],
     ['compression', (d.uniform/d.ncells).toFixed(0)+'×'],
     ['drivable', d.drivable.toFixed(1)+' %'],
-    ['tiers 5/10/20/40', d.lvlcount.join(' / ')],
+    ['tier cells (5/10/20/40 cm)', d.lvlcount.join(' / ')],
   ];
-  if (d.clusters != null)
-    rows.push(['clusters', d.clusters], ['cars', d.cars], ['ped / cyclist', d.vru]);
-  if (d.ego)
+  if (d.clusters != null){
+    rows.push(['geometric clusters', fmt(d.clusters)],
+              ['detected objects', fmt(detectedObjs)],
+              ['  cars', fmt(d.cars || 0)],
+              ['  ped / cyclist', fmt(d.vru || 0)]);
+  }
+  if (d.ego){
     rows.push(['ego Δx / Δy', `${d.ego.tx.toFixed(2)} / ${d.ego.ty.toFixed(2)} m`],
               ['ego speed', `${d.ego.speed_kmh.toFixed(1)} km/h`],
               ['ego confidence', d.ego.confidence.toFixed(2)],
               ['dynamic / static objects', `${d.motion?.dynamic_objects||0} / ${d.motion?.static_objects||0}`],
-              ['motion MLP', d.motion?.mlp_enabled ? `${d.motion?.mlp_dynamic_objects||0} learned dynamic · ${d.motion?.mlp_overrides||0} overrides` : 'geometry-only'],
-              ['motion points D/S/U', `${fmt(d.motion?.dynamic_points||0)} / ${fmt(d.motion?.static_points||0)} / ${fmt(d.motion?.unknown_points||0)}`]);
-    const objs = d.objects || [];
-    if (objs.length){
-      const speeds = objs.filter(o=>o.track_id && o.age>1).map(o=>o.relative_speed_kmh||0);
-      const dyn = objs.filter(o=>o.state==='DYNAMIC').length;
-      rows.push(['tracked objects', `${objs.length} (${dyn} dynamic)`],
-                ['tracked speed max', `${speeds.length ? Math.max(...speeds).toFixed(1) : '0.0'} km/h rel.`]);
-    }
-  rows.push(['fetch', d.ms.fetch+' ms'], ['labels', d.ms.label+' ms'],
-            ['grid', d.ms.grid+' ms'], ['surface', d.ms.surface+' ms']);
+              ['motion MLP', d.motion?.mlp_enabled ? `${d.motion?.mlp_dynamic_objects||0} dynamic · ${d.motion?.mlp_overrides||0} overrides` : 'geometry-only'],
+              ['motion points (D/S/U)', `${fmt(d.motion?.dynamic_points||0)} / ${fmt(d.motion?.static_points||0)} / ${fmt(d.motion?.unknown_points||0)}`]);
+  } else {
+    rows.push(['ego motion', '— (first frame)'],
+              ['motion state', '— (requires prior frame)']);
+  }
+  const objs = d.objects || [];
+  if (objs.length){
+    const speeds = objs.filter(o=>o.track_id && o.age>1).map(o=>o.relative_speed_kmh||0);
+    const dyn = objs.filter(o=>o.state==='DYNAMIC').length;
+    rows.push(['tracked objects', `${objs.length} (${dyn} dynamic)`],
+              ['max tracked speed (rel.)', `${speeds.length ? Math.max(...speeds).toFixed(1) : '0.0'} km/h`]);
+  } else if (d.ego) {
+    rows.push(['tracked objects', '0'],
+              ['max tracked speed (rel.)', '—']);
+  }
+  rows.push(['fetch', d.ms.fetch+' ms'],
+            ['labels', d.ms.label+' ms'],
+            ['motion', (d.ms.motion != null ? d.ms.motion : 0)+' ms'],
+            ['grid', d.ms.grid+' ms'],
+            ['surface', d.ms.surface+' ms']);
   $('kv').innerHTML = rows.map(r=>`<dt>${r[0]}</dt><dd class="mono">${r[1]}</dd>`).join('');
   legend();
 }

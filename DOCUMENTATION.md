@@ -659,3 +659,36 @@ The project evolved from a static terrain representation into a complete, dynami
 6. **Temporal Tracking & Trajectory Estimation**: Implemented Hungarian matching on ego-compensated centroids, persistent track ID assignment, and ordinary least-squares multi-frame trajectory fitting for relative velocity estimation.
 7. **Hysteresis & Refinement**: Added directional consistency checks, state promotion/demotion hysteresis, and an optional 20-feature neural MLP refinement layer.
 8. **Complete System Integration**: Unified detector and ground-truth oracle paths into an asynchronous FastAPI + SSE web streaming service with interactive 2.5D Canvas visualization.
+
+---
+
+## 22. Dashboard Metrics and Definitions
+
+Every statistic displayed in the interactive web UI corresponds to a rigorous backend calculation and population definition:
+
+| Display Label | Backend Field | Population | Unit | Mathematical Definition & Source |
+| :--- | :--- | :--- | :--- | :--- |
+| **points in** | `npts` | LiDAR points | count | Points within $70\text{ m}$ cylindrical range: $\sum [r_{xy} < 70\text{ m}]$. |
+| **cells at 5 cm** | `fine` | Base cells | count | Occupied $5\text{ cm}$ base bins before adaptive coarsening. |
+| **adaptive cells** | `ncells` | Grid cells | count | Total active multi-tier cells: $N_{\text{cells}} = \sum_{l=0}^{3} \text{lvlcount}[l]$. |
+| **compression** | `uniform / ncells` | Ratio | $\times$ | Theoretical dense grid cells ($1600 \times 1600 \times 3$) / active cells. |
+| **drivable** | `drivable` | Active cells | $\%$ | $\frac{1}{N_{\text{cells}}} \sum_{c} \mathbb{I}(\text{trav}_c = \text{True}) \times 100$. |
+| **tier cells (5/10/20/40 cm)** | `lvlcount` | Active cells | counts | Cells per tier: Level 0 ($5\text{ cm}$), 1 ($10\text{ cm}$), 2 ($20\text{ cm}$), 3 ($40\text{ cm}$). |
+| **geometric clusters** | `clusters` | Non-ground clusters | count | Connected components from voxel graph ($20\text{ cm}$ voxel, $\ge 20$ pts). |
+| **detected objects** | `cars + vru` | Semantic objects | count | Foreground clusters classified by PointNet as Car, Pedestrian, or Cyclist. |
+| **  cars** | `cars` | Object clusters | count | Clusters with PointNet class label `Car` ($1$). |
+| **  ped / cyclist** | `vru` | Object clusters | count | Clusters with PointNet class label `Pedestrian` ($2$) or `Cyclist` ($3$). |
+| **ego Δx / Δy** | `ego.tx / ego.ty` | Sensor frame | $\text{m}$ | Planar translation from Fourier phase correlation + ICP. |
+| **ego speed** | `ego.speed_kmh` | Sensor | $\text{km/h}$ | $\frac{\sqrt{\Delta x^2 + \Delta y^2}}{\Delta t} \times 3.6$ (nominal $\Delta t = 0.1\text{ s}$). |
+| **ego confidence** | `ego.confidence` | FFT registration | $[0, 1]$ | Normalized phase correlation peak-to-sidelobe ratio. |
+| **dynamic / static objects** | `motion.dynamic_objects / static_objects` | Detected objects | count | Objects evaluated as `DYNAMIC` vs `STATIC` via residuals + hysteresis. |
+| **motion MLP** | `motion.mlp_dynamic_objects` | Refinement | status | Neural refinement state (`geometry-only` or learned dynamic/overrides). |
+| **motion points (D/S/U)** | `dynamic / static / unknown_points` | Valid points | counts | Dynamic ($D$), static ($S$), and unclassified ($U$) points. $D + S + U = \text{npts}$. |
+| **tracked objects** | `objects.length` | Persistent tracks | count | Active tracks maintained by Hungarian matching ($D_{\text{gate}} \le 2.5\text{ m}$). |
+| **max tracked speed (rel.)** | `max(relative_speed_kmh)` | Tracked objects | $\text{km/h}$ | Maximum OLS trajectory velocity magnitude relative to ego vehicle. |
+| **fetch** | `ms.fetch` | I/O | $\text{ms}$ | Raw `.bin` and `.label` fetch/load time. |
+| **labels** | `ms.label` | Inference | $\text{ms}$ | Ground removal + clustering + PointNet forward pass. |
+| **motion** | `ms.motion` | Registration | $\text{ms}$ | SE(2) ego-motion + spatial residuals + tracking + hysteresis. |
+| **grid** | `ms.grid` | 2.5D raster | $\text{ms}$ | Adaptive variable-resolution quantization and terrain analysis. |
+| **surface** | `ms.surface` | Export | $\text{ms}$ | 2.5D mesh extraction and Base64 serialization for web client. |
+
